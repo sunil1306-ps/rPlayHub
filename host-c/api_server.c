@@ -1,3 +1,14 @@
+#define _GNU_SOURCE
+#include <sched.h>
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+#endif
 #include "api_server.h"
 
 #include <plist/plist.h>
@@ -48,6 +59,8 @@ static int viewer_count;
 /* NALs dropped because a viewer could not keep up. Declared here because
  * stream_info reports it and is defined above the fan-out that maintains it. */
 static uint64_t viewer_drops_total;
+
+static void ensure_media(void);
 
 /* ------------------------------------------------------------------ tiny JSON helpers
  *
@@ -199,6 +212,8 @@ typedef struct {
 
 /* Buffers are per connection, not shared: each client runs on its own thread, so a single static
  * reassembly buffer would let two concurrent calls scribble over each other's replies. */
+static int g_consec_tun_fails = 0;
+
 static int svc_open(svc_conn *c, const char *addr, long port)
 {
     c->fd = -1;
@@ -210,7 +225,7 @@ static int svc_open(svc_conn *c, const char *addr, long port)
     if (!c->reassembly || !c->raw) { free(c->reassembly); free(c->raw); return -1; }
 
     /* Connect through the tunnel (kernel socket, or lwIP when userspace mode is on). */
-    c->fd = tun_connect(addr, (int)port, 3);
+    c->fd = tun_connect(addr, (int)port, 5);
     if (c->fd < 0) goto fail;
 
     rp_rxpc_io io = { svc_read, svc_write, &c->fd };
@@ -427,66 +442,249 @@ static int hid_send(rp_rxpc_session *s, const uint8_t report[58])
     return rp_rxpc_send(s, body, w.len, 0);
 }
 
-/* Hardware-style buttons, expressed as the gestures that actually perform them.
- *
- * The device advertises a "mainScreenButtons" HID surface (_ServiceID 1026) alongside the
- * touchscreen, but its report format is not known and guessing at one risks sending the phone
- * something arbitrary. On every iPhone this code targets, Home and App Switcher ARE gestures --
- * a swipe up from the bottom edge, short for one and held for the other -- so they go through
- * the touchscreen surface whose format is verified. Verified live: an edge swipe from an open
- * app returns to the home screen.
- *
- * Buttons that are genuinely not gestures (lock, volume, Siri) are refused rather than faked. */
-static void method_button(int fd, long id, const char *line)
+static svc_conn g_hid_conn;
+static int g_hid_connected = 0;
+static pthread_mutex_t g_hid_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static svc_conn *hid_get_conn(const api_session *sess)
+{
+    if (g_hid_connected && g_hid_conn.fd >= 0) {
+        return &g_hid_conn;
+    }
+    if (g_hid_connected) {
+        svc_close(&g_hid_conn);
+        g_hid_connected = 0;
+    }
+    if (svc_open(&g_hid_conn, sess->tunnel_addr, sess->hid_port) == 0) {
+        g_hid_connected = 1;
+        return &g_hid_conn;
+    }
+    return NULL;
+}
+
+static void hid_invalidate(void)
+{
+    if (g_hid_connected) {
+        svc_close(&g_hid_conn);
+        g_hid_connected = 0;
+    }
+}
+
+static svc_conn g_indigo_conn;
+static int g_indigo_connected = 0;
+static pthread_mutex_t g_indigo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static svc_conn *indigo_get_conn(const api_session *sess)
+{
+    if (g_indigo_connected && g_indigo_conn.fd >= 0) {
+        return &g_indigo_conn;
+    }
+    if (g_indigo_connected) {
+        svc_close(&g_indigo_conn);
+        g_indigo_connected = 0;
+    }
+    if (sess->indigo_port && svc_open(&g_indigo_conn, sess->tunnel_addr, sess->indigo_port) == 0) {
+        g_indigo_connected = 1;
+        return &g_indigo_conn;
+    }
+    return NULL;
+}
+
+static void indigo_invalidate(void)
+{
+    if (g_indigo_connected) {
+        svc_close(&g_indigo_conn);
+        g_indigo_connected = 0;
+    }
+}
+
+static int indigo_send_button_state(rp_rxpc_session *s, uint64_t usage_page, uint64_t usage_code, uint64_t state)
+{
+    uint8_t body[512];
+    rp_xpc_writer w;
+    rp_xpc_writer_init(&w, body, sizeof body);
+    rp_xpc_dict_begin(&w);
+    rp_xpc_set_string(&w, "featureIdentifier", "com.apple.coredevice.feature.remote.hid.button");
+    rp_xpc_set_string(&w, "messageType", "IndigoButtonEvent");
+    rp_xpc_key(&w, "payload");
+    rp_xpc_dict_begin(&w);
+    rp_xpc_set_uint64(&w, "state", state);
+    rp_xpc_set_uint64(&w, "usagePage", usage_page);
+    rp_xpc_set_uint64(&w, "usageCode", usage_code);
+    rp_xpc_dict_end(&w);
+    rp_xpc_dict_end(&w);
+    if (w.overflow) return -1;
+    return rp_rxpc_send(s, body, w.len, 0);
+}
+
+static int indigo_press(const api_session *sess, uint64_t usage_page, uint64_t usage_code, long hold_ms)
+{
+    pthread_mutex_lock(&g_indigo_lock);
+    svc_conn *c = indigo_get_conn(sess);
+    if (!c) {
+        pthread_mutex_unlock(&g_indigo_lock);
+        return -1;
+    }
+    /* state: 1 = DOWN, 2 = UP */
+    if (indigo_send_button_state(&c->s, usage_page, usage_code, 1) != 0) {
+        indigo_invalidate();
+        pthread_mutex_unlock(&g_indigo_lock);
+        return -1;
+    }
+    struct timespec hold = {hold_ms / 1000, (hold_ms % 1000) * 1000000L};
+    nanosleep(&hold, NULL);
+    if (indigo_send_button_state(&c->s, usage_page, usage_code, 2) != 0) {
+        indigo_invalidate();
+        pthread_mutex_unlock(&g_indigo_lock);
+        return -1;
+    }
+    struct timespec settle = {0, 50 * 1000000L};
+    nanosleep(&settle, NULL);
+    pthread_mutex_unlock(&g_indigo_lock);
+    return 0;
+}
+
+/* Hardware-style buttons, expressed via native CoreDevice Indigo HID or edge gestures. */
+static void perform_edge_flick(svc_conn *c, double from_y, double to_y, int steps, long step_ms)
+{
+    uint8_t report[58];
+    const double x = 0.5;
+    uint16_t px = (uint16_t)(x * 65535.0);
+    uint16_t py_start = (uint16_t)(from_y * 65535.0);
+
+    /* 1. Initial grip/dwell on the Home Indicator bar (40ms) to firmly engage UIKit edge-protect */
+    touch_report(report, TS_STATE_CONTACT, px, py_start);
+    if (hid_send(&c->s, report) != 0) { hid_invalidate(); return; }
+    struct timespec dwell = {0, 40 * 1000000L};
+    nanosleep(&dwell, NULL);
+
+    /* 2. Smooth upward flick to upper-middle of screen */
+    for (int i = 1; i <= steps; i++) {
+        double t = (double)i / (double)steps;
+        uint16_t py = (uint16_t)((from_y + (to_y - from_y) * t) * 65535.0);
+        touch_report(report, TS_STATE_CONTACT, px, py);
+        if (hid_send(&c->s, report) != 0) {
+            hid_invalidate();
+            return;
+        }
+        struct timespec sl = {0, step_ms * 1000000L};
+        nanosleep(&sl, NULL);
+    }
+    touch_report(report, TS_STATE_RELEASE, px, (uint16_t)(to_y * 65535.0));
+    if (hid_send(&c->s, report) != 0) {
+        hid_invalidate();
+    }
+}
+
+static void method_button_named(int fd, long id, const char *button)
 {
     const api_session *sess = g_session;
+
+    /* 1. If Indigo HID service is available, dispatch native hardware button */
+    if (sess->indigo_port) {
+        int rc = -1;
+        if (!strcmp(button, "home")) {
+            rc = indigo_press(sess, 0x0C, 0x40, 50); /* Consumer / Menu (Home) */
+        } else if (!strcmp(button, "lock") || !strcmp(button, "power")) {
+            rc = indigo_press(sess, 0x0C, 0x30, 500); /* Consumer / Power */
+        } else if (!strcmp(button, "volume_up") || !strcmp(button, "volumeUp")) {
+            rc = indigo_press(sess, 0x0C, 0xE9, 50); /* Consumer / Volume Increment */
+        } else if (!strcmp(button, "volume_down") || !strcmp(button, "volumeDown")) {
+            rc = indigo_press(sess, 0x0C, 0xEA, 50); /* Consumer / Volume Decrement */
+        } else if (!strcmp(button, "mute")) {
+            rc = indigo_press(sess, 0x0C, 0xE2, 50); /* Consumer / Mute */
+        } else if (!strcmp(button, "siri")) {
+            rc = indigo_press(sess, 0x0C, 0xCF, 1000); /* Consumer / Voice Command */
+        }
+        if (rc == 0) {
+            if (g_media) media_request_keyframe(g_media);
+            send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
+            return;
+        }
+    }
+
+    if (strcmp(button, "home") != 0 && strcmp(button, "app_switcher") != 0) {
+        reply_error(fd, id, "not_implemented",
+                    "only home, lock, volume, siri, and app_switcher are supported");
+        return;
+    }
+
     if (!sess->hid_port) {
         reply_error(fd, id, "unavailable", "the device did not offer universalhidservice");
         return;
     }
+
+    pthread_mutex_lock(&g_hid_lock);
+    svc_conn *c = hid_get_conn(sess);
+    if (!c) {
+        pthread_mutex_unlock(&g_hid_lock);
+        reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
+        return;
+    }
+
+    if (!strcmp(button, "home")) {
+        /* Ensure media stream is running so Apple's UIKit accepts HID touch */
+        ensure_media();
+        /* Dynamic upward flick from home bar (0.990 -> 0.35) in 10 steps over 180ms */
+        perform_edge_flick(c, 0.990, 0.35, 10, 18);
+    } else if (!strcmp(button, "app_switcher")) {
+        ensure_media();
+        /* App switcher: swipe up from bottom home indicator (0.990 -> 0.60),
+         * dwell for 500ms with micro-jitter (so UIKit does not deduplicate and drop the touch),
+         * then release */
+        uint8_t report[58];
+        const double from_y = 0.990, to_y = 0.60, x = 0.50;
+        uint16_t px = (uint16_t)(x * 65535.0);
+        uint16_t py_start = (uint16_t)(from_y * 65535.0);
+
+        /* 1. Initial grip on bottom edge (60ms) */
+        touch_report(report, TS_STATE_CONTACT, px, py_start);
+        if (hid_send(&c->s, report) != 0) { hid_invalidate(); }
+        struct timespec dwell = {0, 60 * 1000000L};
+        nanosleep(&dwell, NULL);
+
+        /* 2. Drag smoothly up to middle of screen (20 steps over ~300ms) */
+        const int steps = 20;
+        for (int i = 1; i <= steps; i++) {
+            double t = (double)i / (double)steps;
+            uint16_t py = (uint16_t)((from_y + (to_y - from_y) * t) * 65535.0);
+            touch_report(report, TS_STATE_CONTACT, px, py);
+            if (hid_send(&c->s, report) != 0) { hid_invalidate(); break; }
+            struct timespec sl = {0, 15 * 1000000L};
+            nanosleep(&sl, NULL);
+        }
+
+        /* 3. Dwell at center while continuing to send contact reports with active jitter */
+        uint16_t py_end = (uint16_t)(to_y * 65535.0);
+        for (int i = 0; i < 25; i++) {
+            uint16_t py_jitter = py_end + ((i % 2 == 0) ? 20 : -20);
+            touch_report(report, TS_STATE_CONTACT, px, py_jitter);
+            if (hid_send(&c->s, report) != 0) { hid_invalidate(); break; }
+            struct timespec sl = {0, 20 * 1000000L};
+            nanosleep(&sl, NULL);
+        }
+
+        /* 4. Release finger */
+        touch_report(report, TS_STATE_RELEASE, px, py_end);
+        hid_send(&c->s, report);
+    }
+
+    pthread_mutex_unlock(&g_hid_lock);
+
+    /* Prompt immediate IDR keyframe so button actions reflect instantly on the video stream */
+    if (g_media) media_request_keyframe(g_media);
+
+    send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
+}
+
+static void method_button(int fd, long id, const char *line)
+{
     char button[32] = {0};
     if (json_string_field(line, "button", button, sizeof button) != 0 || !button[0]) {
         reply_error(fd, id, "bad_request", "button is required");
         return;
     }
-
-    /* Both start at the bottom edge; the switcher travels further and dwells. */
-    double to_y;
-    long duration;
-    if (!strcmp(button, "home")) {
-        to_y = 0.50; duration = 160;
-    } else if (!strcmp(button, "app_switcher")) {
-        to_y = 0.35; duration = 420;
-    } else {
-        reply_error(fd, id, "not_implemented",
-                    "only home and app_switcher are gestures; lock, volume and siri need the "
-                    "mainScreenButtons HID report format, which is not decoded yet");
-        return;
-    }
-
-    svc_conn c;
-    if (svc_open(&c, sess->tunnel_addr, sess->hid_port) != 0) {
-        reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
-        return;
-    }
-
-    uint8_t report[58];
-    const double from_y = 0.995, x = 0.5;
-    const int steps = 20;
-    for (int i = 0; i <= steps; i++) {
-        double t = (double)i / (double)steps;
-        uint16_t px = (uint16_t)(x * 65535.0);
-        uint16_t py = (uint16_t)((from_y + (to_y - from_y) * t) * 65535.0);
-        touch_report(report, TS_STATE_CONTACT, px, py);
-        if (hid_send(&c.s, report) != 0) break;
-        struct timespec sl = {0, (long)(duration * 1000000L / (steps + 1))};
-        nanosleep(&sl, NULL);
-    }
-    touch_report(report, TS_STATE_RELEASE, (uint16_t)(x * 65535.0), (uint16_t)(to_y * 65535.0));
-    hid_send(&c.s, report);
-    svc_close(&c);
-
-    send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
+    method_button_named(fd, id, button);
 }
 
 static void method_touch(int fd, long id, const char *line, int is_swipe)
@@ -497,13 +695,19 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
         return;
     }
     /* Fractions of the screen, so none of this needs the device's pixel dimensions.
-     * A tap sends fx/fy; a swipe sends fx0/fy0 and fx1/fy1. */
+     * A tap sends fx/fy or x/y; a swipe sends fx0/fy0 and fx1/fy1 (or x0/y0 and x1/y1). */
     double fx = json_fraction(line, "fx", -1), fy = json_fraction(line, "fy", -1);
+    if (fx < 0) fx = json_fraction(line, "x", -1);
+    if (fy < 0) fy = json_fraction(line, "y", -1);
     double fx1 = fx, fy1 = fy;
     fx  = json_fraction(line, "fx0", fx);
     fy  = json_fraction(line, "fy0", fy);
-    fx1 = json_fraction(line, "fx1", fx);
-    fy1 = json_fraction(line, "fy1", fy);
+    fx  = json_fraction(line, "x0", fx);
+    fy  = json_fraction(line, "y0", fy);
+    fx1 = json_fraction(line, "fx1", fx1);
+    fy1 = json_fraction(line, "fy1", fy1);
+    fx1 = json_fraction(line, "x1", fx1);
+    fy1 = json_fraction(line, "y1", fy1);
 
     if (fx < 0 || fx > 1 || fy < 0 || fy > 1) {
         reply_error(fd, id, "bad_request", "fx and fy must be fractions between 0 and 1");
@@ -511,28 +715,64 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
     }
     long duration = json_number_field(line, "duration_ms", is_swipe ? 300 : 60);
 
-    svc_conn c;
-    if (svc_open(&c, sess->tunnel_addr, sess->hid_port) != 0) {
+    /* Keep media stream active so UIKit HID security gate is always unlocked */
+    ensure_media();
+
+    pthread_mutex_lock(&g_hid_lock);
+    svc_conn *c = hid_get_conn(sess);
+    if (!c) {
+        pthread_mutex_unlock(&g_hid_lock);
         reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
         return;
     }
 
     uint8_t report[58];
-    int steps = is_swipe ? 20 : (int)(duration / 12);
-    if (steps < 1) steps = 1;
-    for (int i = 0; i <= steps; i++) {
-        double t = (double)i / (double)steps;
-        uint16_t x = (uint16_t)((fx + (fx1 - fx) * t) * 65535.0);
-        uint16_t y = (uint16_t)((fy + (fy1 - fy) * t) * 65535.0);
+    if (!is_swipe) {
+        /* Low-latency tap: single contact, calibrated 80ms settle (required by UIKit gesture recognizers), release */
+        uint16_t x = (uint16_t)(fx * 65535.0);
+        uint16_t y = (uint16_t)(fy * 65535.0);
         touch_report(report, TS_STATE_CONTACT, x, y);
-        if (hid_send(&c.s, report) != 0) break;
-        struct timespec sl = {0, (long)(duration * 1000000L / (steps + 1))};
-        nanosleep(&sl, NULL);
+        if (hid_send(&c->s, report) == 0) {
+            long tap_ms = duration > 0 ? duration : 80;
+            if (tap_ms < 50) tap_ms = 50;
+            if (tap_ms > 1000) tap_ms = 1000;
+            struct timespec sl = {tap_ms / 1000, (tap_ms % 1000) * 1000000L};
+            nanosleep(&sl, NULL);
+        } else {
+            hid_invalidate();
+        }
+        touch_report(report, TS_STATE_RELEASE, x, y);
+        if (hid_send(&c->s, report) != 0) {
+            hid_invalidate();
+        }
+    } else {
+        /* Smooth, snappy swipe: 10 steps paced over duration */
+        int steps = 10;
+        long step_ns = (duration * 1000000L) / (steps + 1);
+        if (step_ns > 20000000L) step_ns = 20000000L;
+        if (step_ns < 5000000L)  step_ns = 5000000L;
+        for (int i = 0; i <= steps; i++) {
+            double t = (double)i / (double)steps;
+            uint16_t x = (uint16_t)((fx + (fx1 - fx) * t) * 65535.0);
+            uint16_t y = (uint16_t)((fy + (fy1 - fy) * t) * 65535.0);
+            touch_report(report, TS_STATE_CONTACT, x, y);
+            if (hid_send(&c->s, report) != 0) {
+                hid_invalidate();
+                break;
+            }
+            struct timespec sl = {0, step_ns};
+            nanosleep(&sl, NULL);
+        }
+        touch_report(report, TS_STATE_RELEASE,
+                     (uint16_t)(fx1 * 65535.0), (uint16_t)(fy1 * 65535.0));
+        if (hid_send(&c->s, report) != 0) {
+            hid_invalidate();
+        }
     }
-    touch_report(report, TS_STATE_RELEASE,
-                 (uint16_t)(fx1 * 65535.0), (uint16_t)(fy1 * 65535.0));
-    hid_send(&c.s, report);
-    svc_close(&c);
+    pthread_mutex_unlock(&g_hid_lock);
+
+    /* Prompt immediate IDR keyframe so button actions reflect instantly on the video stream */
+    if (g_media) media_request_keyframe(g_media);
 
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
 }
@@ -611,7 +851,7 @@ static const char *relay_checkin(int s)
 {
     char reply[4096];
     if (relay_send_request(s, "RSDCheckin",
-                           "\t<key>Label</key>\n\t<string>rplay-hub</string>\n"
+                           "\t<key>Label</key>\n\t<string>cesium-core</string>\n"
                            "\t<key>ProtocolVersion</key>\n\t<string>2</string>\n",
                            reply, sizeof reply) != 0 || !strstr(reply, "RSDCheckin"))
         return "RSDCheckin: no/bad reply from device";
@@ -797,16 +1037,21 @@ static void send_all(int fd, const char *p, size_t n)
  * array of app dictionaries (bundleIdentifier, name, version, isFirstParty, ...), listprocesses
  * an array of {processIdentifier, executable}, launch the new process's identifier.
  */
+static pthread_mutex_t g_app_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int app_invoke(int fd, long id, const char *feature, const uint8_t *input, size_t n,
                       const char *what)
 {
+    pthread_mutex_lock(&g_app_lock);
     const api_session *sess = g_session;
     if (!sess->app_port) {
+        pthread_mutex_unlock(&g_app_lock);
         reply_error(fd, id, "unavailable", "the device did not offer coredevice.appservice");
         return -1;
     }
     svc_conn c;
     if (svc_open(&c, sess->tunnel_addr, sess->app_port) != 0) {
+        pthread_mutex_unlock(&g_app_lock);
         reply_error(fd, id, "unavailable", "cannot reach coredevice.appservice");
         return -1;
     }
@@ -837,6 +1082,7 @@ static int app_invoke(int fd, long id, const char *feature, const uint8_t *input
         if (b.p) send_all(fd, b.p, b.len);
         free(b.p);
         svc_close(&c);
+        pthread_mutex_unlock(&g_app_lock);
         return -1;
     }
     strbuf b = {0};
@@ -847,6 +1093,7 @@ static int app_invoke(int fd, long id, const char *feature, const uint8_t *input
     else reply_error(fd, id, "internal_error", "out of memory rendering the reply");
     free(b.p);
     svc_close(&c);
+    pthread_mutex_unlock(&g_app_lock);
     return 0;
 }
 
@@ -936,7 +1183,7 @@ static void method_list_apps(int fd, long id, const char *line)
         uint8_t *raw = relay_recv_alloc(s, &n);
         if (!raw) { failed = 1; break; }
         plist_t pl = NULL;
-        plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
+        rp_plist_from_memory(raw, n, &pl);
         if (!pl || plist_get_node_type(pl) != PLIST_DICT) { failed = 1; free(raw); if (pl) plist_free(pl); break; }
         plist_t status = plist_dict_get_item(pl, "Status");
         if (plist_dict_get_item(pl, "Error")) failed = 1;
@@ -999,13 +1246,19 @@ static void method_launch_app(int fd, long id, const char *line)
         reply_error(fd, id, "bad_request", "bundle_id is required");
         return;
     }
+    if (!strcmp(bid, "com.apple.springboard")) {
+        method_button_named(fd, id, "home");
+        return;
+    }
+    char url[1024] = {0};
+    json_string_field(line, "url", url, sizeof url);
     /* platformSpecificOptions is a binary plist of an empty dictionary -- devicectl always sends
      * one and the service rejects the request without it. */
     static const uint8_t empty_bplist[42] = {
         0x62,0x70,0x6c,0x69,0x73,0x74,0x30,0x30,0xd0,0x08,0x00,0x00,0x00,0x00,0x00,0x00,
         0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,
         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x09 };
-    uint8_t input[1024];
+    uint8_t input[2048];
     rp_xpc_writer w;
     rp_xpc_writer_init(&w, input, sizeof input);
     rp_xpc_dict_begin(&w);
@@ -1027,6 +1280,12 @@ static void method_launch_app(int fd, long id, const char *line)
         rp_xpc_set_bool(&w, "standardIOUsesPseudoterminals", true);
         rp_xpc_set_bool(&w, "startStopped", false);
         rp_xpc_set_bool(&w, "terminateExisting", true);
+        if (url[0]) {
+            rp_xpc_key(&w, "payloadURL");
+            rp_xpc_dict_begin(&w);
+              rp_xpc_set_string(&w, "relative", url);
+            rp_xpc_dict_end(&w);
+        }
         rp_xpc_key(&w, "user");
         rp_xpc_dict_begin(&w);
           rp_xpc_set_bool(&w, "active", true);
@@ -1111,7 +1370,7 @@ static void method_list_profiles(int fd, long id)
             uint8_t *raw = relay_send(s, req, sizeof req - 1) == 0 ? relay_recv_alloc(s, &n) : NULL;
             close(s);
             plist_t pl = NULL;
-            if (raw) plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
+            if (raw) rp_plist_from_memory(raw, n, &pl);
             plist_t payload = (pl && plist_get_node_type(pl) == PLIST_DICT) ? plist_dict_get_item(pl, "Payload") : NULL;
             for (uint32_t i = 0; payload && plist_get_node_type(payload) == PLIST_ARRAY
                                 && i < plist_array_get_size(payload); i++) {
@@ -1127,7 +1386,7 @@ static void method_list_profiles(int fd, long id)
                 }
                 if (!start || !stop) continue;
                 plist_t prof = NULL;
-                plist_from_memory(start, (uint32_t)(stop - start), &prof, NULL);
+                rp_plist_from_memory(start, stop - start, &prof);
                 if (!prof) continue;
                 if (plist_get_node_type(prof) == PLIST_DICT) {
                     sb_puts(&b, first ? "{" : ",{");
@@ -1161,7 +1420,7 @@ static void method_list_profiles(int fd, long id)
             uint8_t *raw = relay_send(s, req, sizeof req - 1) == 0 ? relay_recv_alloc(s, &n) : NULL;
             close(s);
             plist_t pl = NULL;
-            if (raw) plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
+            if (raw) rp_plist_from_memory(raw, n, &pl);
             if (pl && plist_get_node_type(pl) == PLIST_DICT) {
                 plist_t ids = plist_dict_get_item(pl, "OrderedIdentifiers");
                 plist_t meta = plist_dict_get_item(pl, "ProfileMetadata");
@@ -1243,7 +1502,7 @@ static void relay_plist_run(int fd, long id, long port, const uint8_t *xml, size
     close(s);
     if (!raw) { reply_error(fd, id, "device_error", "no reply from the device"); return; }
     plist_t pl = NULL;
-    plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
+    rp_plist_from_memory(raw, n, &pl);
     free(raw);
     if (!pl || plist_get_node_type(pl) != PLIST_DICT) {
         if (pl) plist_free(pl);
@@ -1605,7 +1864,7 @@ static int instproxy_run(int fd, long id, const char *xml, size_t xml_len, const
         uint8_t *raw = relay_recv_alloc(s, &n);
         if (!raw) { failed = 1; break; }
         plist_t pl = NULL;
-        plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
+        rp_plist_from_memory(raw, n, &pl);
         free(raw);
         if (!pl || plist_get_node_type(pl) != PLIST_DICT) { failed = 1; if (pl) plist_free(pl); break; }
         plist_t error = plist_dict_get_item(pl, "Error");
@@ -1746,7 +2005,7 @@ static void method_get_app_icon(int fd, long id, const char *line)
     close(s);
     if (!raw) { reply_error(fd, id, "device_error", "no reply from the device"); return; }
     plist_t pl = NULL;
-    plist_from_memory((const char *)raw, (uint32_t)raw_n, &pl, NULL);
+    rp_plist_from_memory(raw, raw_n, &pl);
     free(raw);
     if (!pl || plist_get_node_type(pl) != PLIST_DICT) {
         if (pl) plist_free(pl);
@@ -2274,9 +2533,14 @@ static void ensure_media(void)
         .ssrc = s->ssrc,
         .keyframe_every_s = s->keyframe_every_s,
     };
+static int g_media_failed = 0;
+    if (g_media_failed) return;
     printf("  starting the media stream (viewer connected)\n");
     g_media = media_start(&cfg, on_media_nal, NULL);
-    if (!g_media) printf("  media stream failed to start\n");
+    if (!g_media) {
+        printf("  media stream failed to start; disabling further stream attempts on this device\n");
+        g_media_failed = 1;
+    }
 }
 
 /* ------------------------------------------------------------------ audio
@@ -2713,6 +2977,8 @@ static void dispatch(int fd, const char *line)
     if (!strcmp(method, "list_devices"))      { method_list_devices(fd, id); return; }
     if (!strcmp(method, "stream_info"))       { method_stream_info(fd, id); return; }
     if (!strcmp(method, "press_button"))     { method_button(fd, id, line); return; }
+    if (!strcmp(method, "home"))             { method_button_named(fd, id, "home"); return; }
+    if (!strcmp(method, "app_switcher"))     { method_button_named(fd, id, "app_switcher"); return; }
     if (!strcmp(method, "device_action"))    { method_device_action(fd, id, line); return; }
     if (!strcmp(method, "list_apps"))        { method_list_apps(fd, id, line); return; }
     if (!strcmp(method, "list_processes"))   { method_list_processes(fd, id); return; }
@@ -2735,8 +3001,8 @@ static void dispatch(int fd, const char *line)
     if (!strcmp(method, "set_setting"))       { method_set_setting(fd, id, line); return; }
     if (!strcmp(method, "set_location"))      { method_set_location(fd, id, line, 0); return; }
     if (!strcmp(method, "clear_location"))    { method_set_location(fd, id, line, 1); return; }
-    if (!strcmp(method, "take_screenshot"))   { method_screenshot(fd, id); return; }
-    if (!strcmp(method, "tap"))               { method_touch(fd, id, line, 0); return; }
+    if (!strcmp(method, "take_screenshot") || !strcmp(method, "screenshot")) { method_screenshot(fd, id); return; }
+    if (!strcmp(method, "tap") || !strcmp(method, "touch")) { method_touch(fd, id, line, 0); return; }
     if (!strcmp(method, "swipe"))             { method_touch(fd, id, line, 1); return; }
 
     /* Named explicitly rather than lumped into one message, so the log says which capability is
@@ -2807,26 +3073,54 @@ int api_serve(api_session *session)
     const char *nopx = getenv("RPLAY_NO_VIDEO_PROXY");
     int want_proxy = !(nopx && *nopx == '1');
 
-    int api_fd = listen_on(API_PORT);
-    int video_fd = want_proxy ? listen_on(STREAM_PORT) : -1;
+    int api_port = API_PORT;
+    const char *ap_env = getenv("CESIUM_API_PORT");
+    if (!ap_env || !*ap_env) ap_env = getenv("RPLAY_API_PORT");
+    if (ap_env && *ap_env) api_port = atoi(ap_env);
+
+    int stream_port = STREAM_PORT;
+    const char *sp_env = getenv("CESIUM_STREAM_PORT");
+    if (!sp_env || !*sp_env) sp_env = getenv("RPLAY_STREAM_PORT");
+    if (sp_env && *sp_env) stream_port = atoi(sp_env);
+
+#if defined(__linux__)
+    int priv_ns_fd = -1;
+    if (g_root_ns_fd >= 0) {
+        priv_ns_fd = open("/proc/self/ns/net", O_RDONLY);
+        setns(g_root_ns_fd, CLONE_NEWNET);
+    }
+#endif
+
+    int api_fd = listen_on(api_port);
+    int video_fd = want_proxy ? listen_on(stream_port) : -1;
     /* Not fatal: without it the phone is simply silent, which is how it always was. */
     int audio_fd = listen_on(AUDIO_PORT);
+
+#if defined(__linux__)
+    if (priv_ns_fd >= 0) {
+        setns(priv_ns_fd, CLONE_NEWNET);
+        close(priv_ns_fd);
+    }
+#endif
     if (api_fd < 0 || (want_proxy && video_fd < 0)) {
-        fprintf(stderr, "  cannot listen on %d/%d: %s\n", API_PORT, STREAM_PORT, strerror(errno));
-        fprintf(stderr, "  another cdhost is probably still running -- this one can serve nobody,\n"
+        fprintf(stderr, "  cannot listen on %d/%d: %s\n", api_port, stream_port, strerror(errno));
+        fprintf(stderr, "  another cesium-engine is probably still running -- this one can serve nobody,\n"
                         "  so it is stopping rather than pumping packets for no viewer.\n");
         return -1;
     }
-    printf("  control: 127.0.0.1:%d (JSON lines)\n", API_PORT);
+    printf("  control: 127.0.0.1:%d (JSON lines)\n", api_port);
     if (want_proxy)
         printf("  video:   127.0.0.1:%d (Annex-B fan-out, optional; a player may instead take "
-               "RTP directly)\n", STREAM_PORT);
+               "RTP directly)\n", stream_port);
     else
         printf("  video:   off (RPLAY_NO_VIDEO_PROXY=1) — players take RTP directly\n");
     if (audio_fd >= 0)
         printf("  audio:   127.0.0.1:%d (AAC-ELD frames, <u16 len><u32 ts><frame>)\n", AUDIO_PORT);
     else
         printf("  audio:   cannot listen on %d: %s\n", AUDIO_PORT, strerror(errno));
+
+    /* Warm up media stream immediately so UIKit HID touch gate is open from startup */
+    ensure_media();
 
     for (;;) {
         fd_set rd;

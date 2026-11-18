@@ -20,7 +20,11 @@ int usernet_is_on(void) { return g_on; }
 
 int tun_connect(const char *addr, int port, int timeout_s)
 {
+#ifdef HAVE_USERNET
     if (g_on) return usernet_connect(addr, port);
+#else
+    (void)g_on;
+#endif
     struct sockaddr_in6 sa;
     memset(&sa, 0, sizeof sa);
     sa.sin6_family = AF_INET6;
@@ -37,10 +41,48 @@ int tun_connect(const char *addr, int port, int timeout_s)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 #endif
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    extern char g_ifname[64];
+    char bind_target[64] = {0};
+    if (g_ifname[0]) {
+        char mpath[128], mtarget[256];
+        snprintf(mpath, sizeof(mpath), "/sys/class/net/%s/master", g_ifname);
+        ssize_t mlen = readlink(mpath, mtarget, sizeof(mtarget) - 1);
+        if (mlen > 0) {
+            mtarget[mlen] = '\0';
+            char *slash = strrchr(mtarget, '/');
+            const char *master = slash ? slash + 1 : mtarget;
+            strncpy(bind_target, master, sizeof(bind_target) - 1);
+        } else {
+            strncpy(bind_target, g_ifname, sizeof(bind_target) - 1);
+        }
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, bind_target, strlen(bind_target));
+    }
+#endif
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
     return fd;
 }
 
-long tun_read(int fd, void *buf, size_t n)  { return usernet_owns(fd) ? usernet_read(fd, buf, n) : (long)recv(fd, buf, n, 0); }
-long tun_write(int fd, const void *buf, size_t n) { return usernet_owns(fd) ? usernet_write(fd, buf, n) : (long)send(fd, buf, n, 0); }
-void tun_close(int fd) { if (usernet_owns(fd)) usernet_close(fd); else close(fd); }
+long tun_read(int fd, void *buf, size_t n)
+{
+#ifdef HAVE_USERNET
+    if (usernet_owns(fd)) return usernet_read(fd, buf, n);
+#endif
+    return (long)recv(fd, buf, n, 0);
+}
+
+long tun_write(int fd, const void *buf, size_t n)
+{
+#ifdef HAVE_USERNET
+    if (usernet_owns(fd)) return usernet_write(fd, buf, n);
+#endif
+    return (long)send(fd, buf, n, 0);
+}
+
+void tun_close(int fd)
+{
+#ifdef HAVE_USERNET
+    if (usernet_owns(fd)) { usernet_close(fd); return; }
+#endif
+    close(fd);
+}

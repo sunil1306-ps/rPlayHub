@@ -4,8 +4,7 @@
  * This is the gateway to everything above the tunnel: RSD's handshake and every coredevice.*
  * service invocation are XPC dictionaries inside a RemoteXPC wrapper, carried over HTTP/2.
  *
- * Wire format (all little-endian), verified against a real device by the Python implementation
- * this is ported from (host/rplayhub/wire/xpc.py):
+ * Wire format (all little-endian), verified against real iOS physical devices:
  *
  *   wrapper : magic 0x29B00B92 | flags u32 | length u64 | message_id u64 | [payload]
  *   payload : magic 0x42133742 | version 5 | object

@@ -1,6 +1,6 @@
 /* ddi.h -- mount the personalized Developer Disk Image without Xcode or Device Hub.
  *
- * iOS 17+ discards the DDI on every reboot, and the CoreDevice services rPlayHub needs go quiet
+ * iOS 17+ discards the DDI on every reboot, and the CoreDevice services Cesium needs go quiet
  * until one is mounted again. This does what Device Hub does silently on connect: query the
  * phone's identity and per-boot nonce over mobile_image_mounter, ask Apple's TSS server for a
  * ticket bound to this device and boot, upload the image, and mount it. Ported from the proven

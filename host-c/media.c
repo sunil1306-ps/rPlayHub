@@ -291,14 +291,23 @@ static void *recv_loop(void *arg)
 
 /* ------------------------------------------------------------------ RTCP timer */
 
+static const char *get_config_env(const char *key) {
+    char cname[64];
+    snprintf(cname, sizeof(cname), "CESIUM_%s", key);
+    const char *v = getenv(cname);
+    if (v && *v) return v;
+    char rname[64];
+    snprintf(rname, sizeof(rname), "RPLAY_%s", key);
+    return getenv(rname);
+}
+
 static void *rtcp_loop(void *arg)
 {
     media_session *m = arg;
     uint64_t last_rr = 0, last_pli = 0, last_rctl = 0;
     /* What to ask the encoder for, in bits per second. The device answers TX/RXMaxBitrate = 6 Mbps
-     * and Device Hub asks for exactly that. RPLAY_RCTL=0 disables sending RCTL at all, so the
-     * before/after can be compared without rebuilding. */
-    const char *rctl_env = getenv("RPLAY_RCTL");
+     * and Device Hub asks for exactly that. RPLAY_RCTL=0 (or CESIUM_RCTL=0) disables sending RCTL at all. */
+    const char *rctl_env = get_config_env("RCTL");
     int rctl_on = !(rctl_env && rctl_env[0] == '0' && rctl_env[1] == '\0');
     uint32_t rctl_target = 6000000;
     if (rctl_env && rctl_env[0] && !(rctl_env[0] == '0' && rctl_env[1] == '\0')) {
@@ -482,6 +491,11 @@ static int kernel_udp_socket(int *recv_port)
 {
     int fd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    if (g_bind_dev[0]) {
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, strlen(g_bind_dev));
+    }
+#endif
     struct sockaddr_in6 bind_addr;
     memset(&bind_addr, 0, sizeof bind_addr);
     bind_addr.sin6_family = AF_INET6;
@@ -683,29 +697,29 @@ media_session *media_start(const media_config *cfg, media_nal_fn on_nal, void *c
      *
      * Omitted entirely unless asked for, so the default path stays byte-identical to Apple's. */
     {
-        static const struct { const char *env, *key; } knobs[] = {
-            { "RPLAY_WIDTH",             "CustomWidth"       },
-            { "RPLAY_HEIGHT",            "CustomHeight"      },
-            { "RPLAY_FPS",               "Framerate"         },
-            { "RPLAY_VIDEO_RESOLUTION",  "VideoResolution"   },
-            { "RPLAY_MAX_BITRATE",       "TXMaxBitrate"      },
-            { "RPLAY_MIN_BITRATE",       "TXMinBitrate"      },
-            { "RPLAY_KEYFRAME_INTERVAL", "KeyFrameInterval"  },
+        static const struct { const char *key, *xpc_key; } knobs[] = {
+            { "WIDTH",             "CustomWidth"       },
+            { "HEIGHT",            "CustomHeight"      },
+            { "FPS",               "Framerate"         },
+            { "VIDEO_RESOLUTION",  "VideoResolution"   },
+            { "MAX_BITRATE",       "TXMaxBitrate"      },
+            { "MIN_BITRATE",       "TXMinBitrate"      },
+            { "KEYFRAME_INTERVAL", "KeyFrameInterval"  },
         };
         int any = 0;
         for (size_t i = 0; i < sizeof knobs / sizeof knobs[0]; i++)
-            if (getenv(knobs[i].env)) { any = 1; break; }
+            if (get_config_env(knobs[i].key)) { any = 1; break; }
         if (any && !cfg->audio) {
             rp_xpc_key(&w, "streamConfig");
             rp_xpc_dict_begin(&w);
             for (size_t i = 0; i < sizeof knobs / sizeof knobs[0]; i++) {
-                const char *raw = getenv(knobs[i].env);
+                const char *raw = get_config_env(knobs[i].key);
                 if (!raw || !*raw) continue;
                 char *end = NULL;
                 long v = strtol(raw, &end, 10);
                 if (end == raw || *end) continue;      /* not a number: ignore, do not guess */
-                rp_xpc_set_int64(&w, knobs[i].key, (int64_t)v);
-                fprintf(stderr, "  streamConfig %s=%ld\n", knobs[i].key, v);
+                rp_xpc_set_int64(&w, knobs[i].xpc_key, (int64_t)v);
+                fprintf(stderr, "  streamConfig %s=%ld\n", knobs[i].xpc_key, v);
             }
             rp_xpc_dict_end(&w);
         }
@@ -733,9 +747,12 @@ media_session *media_start(const media_config *cfg, media_nal_fn on_nal, void *c
     char ua[37] = "8f1e2c40-0000-4000-8000-000000000001";
     char ub[37] = "8f1e2c40-0000-4000-8000-000000000002";
     rp_xpc_obj out;
+    rp_xpc_obj reply_err;
+    memset(&reply_err, 0, sizeof(reply_err));
     if (rp_cd_invoke(&m->rxpc, RP_CD_FEATURE_STARTSTREAM, RP_CD_ACTION_STARTSTREAM,
-                     input, w.len, ua, ub, &out, NULL) != 0) {
-        fprintf(stderr, "  startmediastream returned no output\n");
+                     input, w.len, ua, ub, &out, &reply_err) != 0) {
+        fprintf(stderr, "  startmediastream returned no output. Reply dump:\n");
+        dump_xpc(&reply_err, 2);
         goto fail;
     }
     if (getenv("RPLAY_NET_DEBUG") && getenv("RPLAY_NET_DEBUG")[0] == '1') {
@@ -781,6 +798,11 @@ static int connect_service(media_session *m, const char *addr, long port)
     if (inet_pton(AF_INET6, addr, &sa.sin6_addr) != 1) return -1;
     m->svc = socket(AF_INET6, SOCK_STREAM, 0);
     if (m->svc < 0) return -1;
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    if (g_bind_dev[0]) {
+        setsockopt(m->svc, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, strlen(g_bind_dev));
+    }
+#endif
 #ifdef _WIN32
     DWORD ms = 10000;
     setsockopt(m->svc, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof ms);
@@ -925,9 +947,15 @@ void media_stats(const media_session *m, uint64_t *packets, uint64_t *nals, uint
                  uint64_t *late, uint64_t *dup)
 {
     if (!m) {
-        if (packets) *packets = 0; if (nals) *nals = 0; if (keyframes) *keyframes = 0;
-        if (lost) *lost = 0; if (ltr_acked) *ltr_acked = 0; if (mbps) *mbps = 0;
-        if (bad) *bad = 0; if (late) *late = 0; if (dup) *dup = 0;
+        if (packets) *packets = 0;
+        if (nals) *nals = 0;
+        if (keyframes) *keyframes = 0;
+        if (lost) *lost = 0;
+        if (ltr_acked) *ltr_acked = 0;
+        if (mbps) *mbps = 0;
+        if (bad) *bad = 0;
+        if (late) *late = 0;
+        if (dup) *dup = 0;
         return;
     }
     if (packets) *packets = m->packets;

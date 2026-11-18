@@ -20,6 +20,9 @@
 /* The device's sound: AAC-ELD, 48 kHz stereo, 480 samples a frame, one frame per record --
  * <u16 BE length><u32 BE RTP timestamp><frame>. Negotiated when the first listener connects. */
 #define AUDIO_PORT  9878
+#if defined(__linux__)
+extern int g_root_ns_fd;
+#endif
 
 /* One attached device, as usbmuxd reports it.
  *
@@ -81,6 +84,7 @@ typedef struct {
     long        screenshot_port;
     long        display_port;
     long        hid_port;
+    long        indigo_port;          /* com.apple.coredevice.hid.indigo: hardware buttons */
     long        diag_port;            /* diagnostics_relay.shim.remote: restart/shutdown/sleep */
     long        app_port;             /* coredevice.appservice: list/launch/terminate apps */
     long        syslog_port;          /* syslog_relay.shim.remote: the console stream */

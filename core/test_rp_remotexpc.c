@@ -15,7 +15,7 @@
 #include "rp_remotexpc.h"
 #include "rp_http2.h"
 
-/* Byte-for-byte from host/rplayhub/wire/remotexpc.py's opening exchange. */
+/* Byte-for-byte from RemoteXPC wire protocol opening exchange. */
 static const char *EXPECTED_HANDSHAKE_HEX =
     "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a"     /* preface */
     "00000c04000000000000030000006400040010000000"         /* SETTINGS */

@@ -58,7 +58,7 @@ rp_tls_ctx *rp_tls_ctx_new(const uint8_t *cert_pem, size_t cert_len,
     mbedtls_ctr_drbg_init(&c->drbg);
     mbedtls_ssl_config_init(&c->conf);
 
-    static const char *seed = "rplay-hub-cdhost";
+    static const char *seed = "cesium-core-cdhost";
     if (mbedtls_ctr_drbg_seed(&c->drbg, mbedtls_entropy_func, &c->entropy,
                               (const unsigned char *)seed, strlen(seed)) != 0) {
         fprintf(stderr, "tls(mbedtls): could not seed the RNG\n");

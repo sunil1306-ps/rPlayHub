@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
@@ -82,9 +84,9 @@ int cdhost_device_info(const char *udid, char *json, size_t cap)
      * the old code did -- so the panel still shows the basics for an unpaired device. */
     const char *session_error = NULL;
     lockdownd_client_t lk = NULL;
-    if (lockdownd_client_new_with_handshake(dev, &lk, "rplay-hub") != LOCKDOWN_E_SUCCESS || !lk) {
+    if (lockdownd_client_new_with_handshake(dev, &lk, "cesium-core") != LOCKDOWN_E_SUCCESS || !lk) {
         session_error = "no session (device not paired/trusted, or handshake refused)";
-        if (lockdownd_client_new(dev, &lk, "rplay-hub") != LOCKDOWN_E_SUCCESS) {
+        if (lockdownd_client_new(dev, &lk, "cesium-core") != LOCKDOWN_E_SUCCESS) {
             idevice_free(dev);
             snprintf(json, cap, "{\"error\":\"lockdown unreachable\"}");
             return -1;
@@ -173,7 +175,7 @@ int usbmux_enumerate(api_device *out, int max)
         if (idevice_new_with_options(&dev, out[i].udid, IDEVICE_LOOKUP_USBMUX | IDEVICE_LOOKUP_NETWORK) != IDEVICE_E_SUCCESS)
             continue;
         lockdownd_client_t lk = NULL;
-        if (lockdownd_client_new(dev, &lk, "rplay-hub") == LOCKDOWN_E_SUCCESS && lk) {
+        if (lockdownd_client_new(dev, &lk, "cesium-core") == LOCKDOWN_E_SUCCESS && lk) {
             plist_t v = NULL;
             if (lockdownd_get_value(lk, NULL, "DeviceName", &v) == LOCKDOWN_E_SUCCESS && v) {
                 char *s = NULL; plist_get_string_val(v, &s);
@@ -255,7 +257,7 @@ int imd_bringup(void **out_conn, char *udid_out, size_t udidlen,
 
     printf("\n== Layer 1-1.5: lockdown + TLS session (libimobiledevice) ==\n");
     lockdownd_client_t lk = NULL;
-    if (lockdownd_client_new_with_handshake(dev, &lk, "rplay-hub") != LOCKDOWN_E_SUCCESS || !lk) {
+    if (lockdownd_client_new_with_handshake(dev, &lk, "cesium-core") != LOCKDOWN_E_SUCCESS || !lk) {
         fprintf(stderr, "lockdown handshake failed (device paired & trusted?)\n");
         idevice_free(dev); return -1;
     }
@@ -318,30 +320,19 @@ int imd_conn_send(void *conn, const void *buf, size_t n)
 
 int imd_conn_recv(void *conn, void *buf, size_t n)
 {
-    /* Block until exactly n bytes arrive, like the raw-socket recv the pump used to use. A quiet
-     * tunnel between packets is normal and must NOT end the stream.
-     *
-     * This used to assume a timeout came back as SUCCESS with 0 bytes, and treat every non-success
-     * as the connection dropping. That assumption was wrong: IDEVICE_E_TIMEOUT (-7) is a distinct
-     * code, and on this connection -- CoreDeviceProxy, which is SSL -- that is what a quiet window
-     * actually returns. So every 30 seconds of silence killed the packet pump, and the daemon exited
-     * via pump_die reporting "tunnel read ended (errno 0: none)". errno 0 was the tell: no syscall
-     * had failed, because the failure was a library timeout rather than a socket error.
-     *
-     * Timeouts therefore just go round again, including mid-packet (the remaining bytes are still
-     * coming). Any other error still ends it, and the code is returned rather than a bare -1 so the
-     * caller can say which one.
-     *
-     * The tradeoff, deliberately taken: if a dead connection were to report TIMEOUT forever rather
-     * than an error, the pump would wait instead of exiting -- the stale session bug #7 guards
-     * against. An idle daemon the user can restart beats one that quits every 30 seconds, and a
-     * genuinely dropped connection reports a real error, not a timeout. */
     size_t off = 0;
     while (off < n) {
         uint32_t got = 0;
+        errno = 0;
         idevice_error_t e = idevice_connection_receive_timeout((idevice_connection_t)conn, (char *)buf + off, (uint32_t)(n - off), &got, 30000);
         if (e == IDEVICE_E_TIMEOUT) continue;
-        if (e != IDEVICE_E_SUCCESS) return (int)e;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            errno = 0;
+            struct timespec ts = {0, 2000000L};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        if (e != IDEVICE_E_SUCCESS || got == 0) return -1;
         off += got;
     }
     return 0;

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 // coredevice-c — from-scratch CoreDevice host in C, on the CarPlay SDK.
 //
 // Layers 0-2, the C port of scripts/coredevice-host/*.py, verified live against the same iPhone.
@@ -122,13 +124,24 @@ static int tunnel_handshake_full(conn_t *c, char *addr, size_t addrlen,
  * RSD port becomes reachable with an ordinary socket — which is the whole point, and the only
  * step in the stack that needs root.
  *
- * This is the C port of host/rplayhub/net/{tun,pump}.py. The failure signalling matters: if
+ * Native C network pump implementation. The failure signalling matters: if
  * either direction dies the tunnel is dead, and saying so beats looking alive.
  */
+#define IPV6_HDR_LEN 40
+
+static int run_cmd(const char *fmt, ...) {
+    char cmd[512];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap);
+    va_end(ap);
+    int rc = system(cmd);
+    printf("  [cmd] %s -> rc=%d\n", cmd, rc);
+    return rc;
+}
+
 #ifdef __APPLE__
 #define UTUN_CONTROL_NAME "com.apple.net.utun_control"
 #define UTUN_OPT_IFNAME 2
-#define IPV6_HDR_LEN 40
 
 static int utun_open(char *ifname, size_t ifname_len) {
     int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
@@ -154,14 +167,6 @@ static int utun_open(char *ifname, size_t ifname_len) {
     return fd;
 }
 
-static int run_cmd(const char *fmt, ...) {
-    char cmd[512];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(cmd, sizeof cmd, fmt, ap);
-    va_end(ap);
-    return system(cmd);
-}
-
 static int utun_configure(const char *ifname, const char *ours, const char *device, long mtu) {
     if (run_cmd("ifconfig %s inet6 %s prefixlen 64 up >/dev/null 2>&1", ifname, ours) != 0)
         return -1;
@@ -171,6 +176,104 @@ static int utun_configure(const char *ifname, const char *ours, const char *devi
     return 0;
 }
 
+#elif defined(__linux__)
+
+#ifndef TUNSETIFF
+#include <linux/if_tun.h>
+#endif
+#ifndef IFF_TUN
+#define IFF_TUN 0x0001
+#endif
+#ifndef IFF_NO_PI
+#define IFF_NO_PI 0x1000
+#endif
+#ifndef TUNSETIFF
+#define TUNSETIFF _IOW('T', 202, int)
+#endif
+
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+int g_root_ns_fd = -1;
+#endif
+
+char g_ifname[64] = {0};
+char g_bind_dev[64] = {0};
+
+static void detect_bind_dev(const char *ifname) {
+    char path[128], target[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname);
+    ssize_t len = readlink(path, target, sizeof(target) - 1);
+    if (len > 0) {
+        target[len] = '\0';
+        char *slash = strrchr(target, '/');
+        const char *master = slash ? slash + 1 : target;
+        strncpy(g_bind_dev, master, sizeof(g_bind_dev) - 1);
+        printf("  interface %s is slaved to VRF %s\n", ifname, g_bind_dev);
+    } else {
+        strncpy(g_bind_dev, ifname, sizeof(g_bind_dev) - 1);
+    }
+}
+
+static int utun_open(char *ifname, size_t ifname_len) {
+#if defined(__linux__)
+    if (g_root_ns_fd < 0) {
+        g_root_ns_fd = open("/proc/self/ns/net", O_RDONLY);
+        if (g_root_ns_fd >= 0) {
+            if (unshare(CLONE_NEWNET) == 0) {
+                printf("  [netns] isolated private network namespace created (hidden from LANforge/host)\n");
+                run_cmd("ip link set dev lo up");
+            } else {
+                perror("  [netns] unshare CLONE_NEWNET failed");
+                close(g_root_ns_fd);
+                g_root_ns_fd = -1;
+            }
+        }
+    }
+#endif
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    strncpy(ifr.ifr_name, "cesium%d", IFNAMSIZ - 1);
+    if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    strncpy(ifname, ifr.ifr_name, ifname_len - 1);
+    ifname[ifname_len - 1] = '\0';
+    strncpy(g_ifname, ifr.ifr_name, sizeof(g_ifname) - 1);
+    return fd;
+}
+
+static int utun_configure(const char *ifname, const char *ours, const char *device, long mtu) {
+    run_cmd("ip link set dev %s up", ifname);
+    if (mtu > 0) run_cmd("ip link set dev %s mtu %ld", ifname, mtu);
+    if (run_cmd("ip -6 addr add %s/64 dev %s nodad 2>/dev/null || ip -6 addr change %s/64 dev %s nodad", ours, ifname, ours, ifname) != 0)
+        return -1;
+    run_cmd("ip -6 route add %s/128 dev %s 2>/dev/null || ip -6 route change %s/128 dev %s", device, ifname, device, ifname);
+    return 0;
+}
+
+#else
+
+static int utun_open(char *ifname, size_t ifname_len) {
+    (void)ifname; (void)ifname_len;
+    return -1;
+}
+static int utun_configure(const char *ifname, const char *ours, const char *device, long mtu) {
+    (void)ifname; (void)ours; (void)device; (void)mtu;
+    return -1;
+}
+
+#endif
+
 typedef struct {
     int     utun;
     conn_t *tun;
@@ -179,15 +282,6 @@ typedef struct {
     unsigned long tx, rx;
 } pump_t;
 
-/* When either pump thread fails, the CoreDevice tunnel is dead and cannot be recovered without
- * re-establishing it -- which needs a full restart. Rather than leave the daemon serving a
- * live-looking-but-dead session (bug #7: it keeps answering tunnel_info while nothing flows),
- * exit the process. The kernel destroys the utun on exit; the app's control connection drops and
- * it reconnects; under launchd the daemon auto-restarts. A clean drop beats a silent black. */
-/* Include errno and the traffic counters. Every past round of "why did it quit this time" was a
- * guessing game because the message named a stage and nothing else: five call sites, one string
- * each, no way to tell a dropped connection from a transient error, and no idea whether the
- * tunnel had ever carried anything. */
 static void pump_die(const char *reason) {
     int e = errno;
     fprintf(stderr, "\n  tunnel died: %s (errno %d: %s) -- exiting so the session does not go "
@@ -200,42 +294,73 @@ static void *pump_host_to_device(void *arg) {
     uint8_t buf[70000];
     for (;;) {
         ssize_t n = read(p->utun, buf, sizeof buf);
-        /* A signal interrupting the read is not the tunnel dying. macOS's signal() asks for
-         * SA_RESTART so this should not happen, but "should not" is what made the previous
-         * unexplained exits so expensive: retrying costs nothing and removes the whole class. */
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+#ifdef __APPLE__
         if (n <= 4) { pump_die("utun read ended"); }
         if (cwrite(p->tun, buf + 4, (size_t)(n - 4)) < 0) {   /* strip the 4-byte AF prefix */
             pump_die("tunnel write failed");
         }
+#else
+        if (n <= 0) { pump_die("tun read ended"); }
+        if (cwrite(p->tun, buf, (size_t)n) < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINVAL) {
+                errno = 0;
+                continue;
+            }
+            pump_die("tunnel write failed");
+        }
+#endif
         p->tx++;
     }
+    return NULL;
 }
 
 static void *pump_device_to_host(void *arg) {
     pump_t *p = arg;
     uint8_t frame[70000];
+#ifdef __APPLE__
     uint32_t af = htonl(AF_INET6);
+    uint8_t *pkt = frame + 4;
+#else
+    uint8_t *pkt = frame;
+#endif
     for (;;) {
         /* Reframe from a byte stream: Payload Length covers everything after the fixed header. */
-        if (cread_n(p->tun, frame + 4, IPV6_HDR_LEN) < 0) {
+        if (cread_n(p->tun, pkt, IPV6_HDR_LEN) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                errno = 0;
+                continue;
+            }
             pump_die("tunnel read ended");
         }
-        uint16_t plen = ntohs(*(uint16_t *)(frame + 4 + 4));
-        if (plen && cread_n(p->tun, frame + 4 + IPV6_HDR_LEN, plen) < 0) {
+        uint16_t plen = ntohs(*(uint16_t *)(pkt + 4));
+        if (plen && cread_n(p->tun, pkt + IPV6_HDR_LEN, plen) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                errno = 0;
+                continue;
+            }
             pump_die("tunnel read ended mid-packet");
         }
-        memcpy(frame, &af, 4);
         ssize_t w;
+#ifdef __APPLE__
+        memcpy(frame, &af, 4);
         do { w = write(p->utun, frame, 4 + IPV6_HDR_LEN + plen); }
         while (w < 0 && (errno == EINTR || errno == EAGAIN));
+#else
+        do { w = write(p->utun, frame, IPV6_HDR_LEN + plen); }
+        while (w < 0 && (errno == EINTR || errno == EAGAIN));
+#endif
         if (w < 0) {
-            pump_die("utun write failed");
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINVAL) {
+                errno = 0;
+                continue;
+            }
+            pump_die("tunnel write failed");
         }
         p->rx++;
     }
+    return NULL;
 }
-#endif /* __APPLE__ — the kernel-utun path; other platforms use RPLAY_USERSPACE_NET=1 (lwIP) */
 
 /* Defined below, at Layer 3b; the attach path probes candidate ports with it. */
 static int rsd_enumerate(const char *addr, long port, api_session *out);
@@ -297,7 +422,7 @@ static int find_coredevice_tunnel(char *ours, size_t ours_len, char *device, siz
 
     snprintf(ours, ours_len, "%s", found_addr);
     /* The device is ::1 on the same prefix; we are ::2. */
-    char base[128];
+    char base[64];
     snprintf(base, sizeof base, "%s", found_addr);
     char *tail = strrchr(base, ':');
     if (!tail) return -1;
@@ -408,7 +533,25 @@ static int rsd_reachable(const char *device, long rsd_port) {
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 #endif
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    char bind_target[64] = {0};
+    if (g_ifname[0]) {
+        char mpath[128], mtarget[256];
+        snprintf(mpath, sizeof(mpath), "/sys/class/net/%s/master", g_ifname);
+        ssize_t mlen = readlink(mpath, mtarget, sizeof(mtarget) - 1);
+        if (mlen > 0) {
+            mtarget[mlen] = '\0';
+            char *slash = strrchr(mtarget, '/');
+            const char *master = slash ? slash + 1 : mtarget;
+            strncpy(bind_target, master, sizeof(bind_target) - 1);
+        } else {
+            strncpy(bind_target, g_ifname, sizeof(bind_target) - 1);
+        }
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, bind_target, strlen(bind_target));
+    }
+#endif
     int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (rc != 0) fprintf(stderr, "  rsd_reachable connect failed (errno %d: %s)\n", errno, strerror(errno));
     close(fd);
     return rc;
 }
@@ -454,7 +597,28 @@ static int rsd_connect(const char *addr, long port)
     struct timeval tv = { .tv_sec = 8, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 #endif
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    char bind_target[64] = {0};
+    if (g_ifname[0]) {
+        char mpath[128], mtarget[256];
+        snprintf(mpath, sizeof(mpath), "/sys/class/net/%s/master", g_ifname);
+        ssize_t mlen = readlink(mpath, mtarget, sizeof(mtarget) - 1);
+        if (mlen > 0) {
+            mtarget[mlen] = '\0';
+            char *slash = strrchr(mtarget, '/');
+            const char *master = slash ? slash + 1 : mtarget;
+            strncpy(bind_target, master, sizeof(bind_target) - 1);
+        } else {
+            strncpy(bind_target, g_ifname, sizeof(bind_target) - 1);
+        }
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, bind_target, strlen(bind_target));
+    }
+#endif
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        fprintf(stderr, "  rsd_connect failed (errno %d: %s)\n", errno, strerror(errno));
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -585,6 +749,7 @@ static int rsd_enumerate(const char *addr, long port, api_session *out)
         "com.apple.coredevice.devicecontrol",
         "com.apple.coredevice.deviceinfo",
         "com.apple.coredevice.locationservice",
+        "com.apple.coredevice.hid.indigo",
     };
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
         rp_xpc_obj svc, portv;
@@ -615,7 +780,8 @@ static int rsd_enumerate(const char *addr, long port, api_session *out)
                 else if (i == 14) out->configuration_port = resolved;
                 else if (i == 15) out->devicecontrol_port = resolved;
                 else if (i == 16) out->deviceinfo_port = resolved;
-                else out->location_port = resolved;
+                else if (i == 17) out->location_port = resolved;
+                else if (i == 18) out->indigo_port = resolved;
             }
         } else {
             printf("    %-46s MISSING\n", want[i]);
@@ -652,6 +818,8 @@ static const struct { const char *flag, *env, *help; } g_flags[] = {
       "streamConfig TXMaxBitrate, in bits/s. Sent only when given, so the\n"
       "                    default offer stays byte-identical to Apple's." },
     { "--min-bitrate", "RPLAY_MIN_BITRATE", "streamConfig TXMinBitrate, in bits/s." },
+    { "--api-port", "RPLAY_API_PORT", "JSON-RPC control port (default 9876)." },
+    { "--stream-port", "RPLAY_STREAM_PORT", "Annex-B HEVC video stream port (default 9877)." },
 };
 #define N_FLAGS ((int)(sizeof g_flags / sizeof g_flags[0]))
 
@@ -694,6 +862,12 @@ void cdhost_rebind(const char *udid)
 #endif
     if (maxfd < 3 || maxfd > 65536) maxfd = 4096;
     for (int fd = 3; fd < maxfd; fd++) close(fd);
+
+#if defined(__linux__)
+    if (g_root_ns_fd >= 0) {
+        setns(g_root_ns_fd, CLONE_NEWNET);
+    }
+#endif
 
     execv(g_self, args);
     /* Only reached if exec failed; the caller has already replied, so say why and carry on
@@ -741,6 +915,12 @@ static void own_signals(void)
 }
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        if (setuid(0) != 0) {}
+        if (setgid(0) != 0) {}
+    }
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: a daemon's layer log should appear live */
 #ifdef _WIN32
     WSADATA wsa;
@@ -869,23 +1049,15 @@ int main(int argc, char **argv) {
         if (usernet_start(tun.idev, ours, addr) != 0) { fprintf(stderr, "  usernet_start failed\n"); return 1; }
         printf("  lwIP netif up over the tunnel\n");
     } else {
-#ifndef __APPLE__
-        /* The kernel tunnel path is the macOS utun; a Linux TUN equivalent has not been needed
-         * because the userspace stack covers it without root. */
-        fprintf(stderr, "  the kernel utun path is macOS-only — run with RPLAY_USERSPACE_NET=1\n");
-        return 1;
-#else
-        printf("\n== Layer 3a: utun + packet pump ==\n");
+        printf("\n== Layer 3a: tunnel + packet pump ==\n");
         if (geteuid() != 0) {
-            printf("  not root — cannot create a utun. Re-run with sudo, or set RPLAY_USERSPACE_NET=1\n");
-            printf("      sudo %s\n", "./cdhost");
-            printf("\nLayers 0-2 verified in C against the device.\n");
-            return 0;
+            printf("  not root — cannot create a tunnel interface. Re-run with sudo\n");
+            return 1;
         }
         char ifname[64] = {0};
         int utun = utun_open(ifname, sizeof ifname);
-        if (utun < 0) { perror("  utun_open"); return 1; }
-        printf("  utun: %s\n", ifname);
+        if (utun < 0) { perror("  tunnel open"); return 1; }
+        printf("  tunnel: %s\n", ifname);
         if (utun_configure(ifname, ours, addr, mtu) < 0) {
             fprintf(stderr, "  could not configure %s\n", ifname);
             return 1;
@@ -896,7 +1068,6 @@ int main(int argc, char **argv) {
         pthread_create(&t1, NULL, pump_host_to_device, &pump);
         pthread_create(&t2, NULL, pump_device_to_host, &pump);
         printf("  pump running\n");
-#endif /* __APPLE__ */
     }
 
     sleep(1);
@@ -920,8 +1091,9 @@ int main(int argc, char **argv) {
     session.ssrc = (uint32_t)(time(NULL) ^ (uintptr_t)&session);
     if (!session.ssrc) session.ssrc = 1;
     {
-        const char *k = getenv("RPLAY_KEYFRAME_EVERY_S");
-        session.keyframe_every_s = k ? atof(k) : 0.0;
+        const char *k = getenv("CESIUM_KEYFRAME_EVERY_S");
+        if (!k || !*k) k = getenv("RPLAY_KEYFRAME_EVERY_S");
+        session.keyframe_every_s = k ? atof(k) : 1.0; /* Periodic RTCP PLI every 1.0s guarantees crisp stream recovery */
     }
     if (rsd_enumerate(addr, rsd, &session) < 0)
         fprintf(stderr, "  service discovery failed\n");
@@ -934,8 +1106,8 @@ int main(int argc, char **argv) {
     /* Where a shipped DDI would be: Contents/Resources/iOS_DDI, two dirs up from the executable
      * (Contents/MacOS/cdhost). NULL when that folder is absent (dev builds), which makes ddi.c
      * fall back to the system Xcode location. */
-    static char bundle_ddi[1400];
-    { char exe[1200]; snprintf(exe, sizeof exe, "%s", g_self);
+    static char bundle_ddi[4096];
+    { char exe[4096]; snprintf(exe, sizeof exe, "%s", g_self);
       char *macos = strrchr(exe, '/'); if (macos) *macos = 0;      /* .../Contents/MacOS */
       char *contents = strrchr(exe, '/'); if (contents) *contents = 0;  /* .../Contents */
       snprintf(bundle_ddi, sizeof bundle_ddi, "%s/Resources/iOS_DDI", exe);

@@ -37,11 +37,12 @@
  *
  * Untested as of writing. If the device rejects the offer or ignores the token, the default is
  * unchanged and mirroring behaves exactly as before. */
-#define HEVC_FEATURES_DEFAULT   "FLS;SW:1;"
+#define HEVC_FEATURES_DEFAULT   "FLS;VRA:0;MVRA:0;RVRA1:0;SW:1;"
 
 static const char *hevc_features(void)
 {
-    const char *e = getenv("RPLAY_HEVC_FEATURES");
+    const char *e = getenv("CESIUM_HEVC_FEATURES");
+    if (!e || !*e) e = getenv("RPLAY_HEVC_FEATURES");
     const char *use = (e && *e) ? e : HEVC_FEATURES_DEFAULT;
     /* Print it once. An experiment that changes this string is worthless if there is no evidence
      * the string reached the offer -- a negative result would then be indistinguishable from the

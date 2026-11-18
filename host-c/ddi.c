@@ -60,8 +60,23 @@ static int write_all(int fd, const void *buf, size_t n)
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
     while (sent < n) {
-        long w = tun_write(fd, p + sent, n - sent);
-        if (w <= 0) return -1;
+        size_t chunk = n - sent;
+        if (chunk > 65536) chunk = 65536;
+        long w = tun_write(fd, p + sent, chunk);
+        if (w < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct timespec ts = {0, 1000 * 1000};
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            fprintf(stderr, "  write_all failed: sent=%zu/%zu errno=%d (%s)\n",
+                    sent, n, errno, strerror(errno));
+            return -1;
+        }
+        if (w == 0) {
+            fprintf(stderr, "  write_all EOF: sent=%zu/%zu\n", sent, n);
+            return -1;
+        }
         sent += (size_t)w;
     }
     return 0;
@@ -93,7 +108,7 @@ static plist_t recv_plist(int fd)
     uint8_t *buf = malloc(n);
     if (!buf || recvn(fd, buf, n) != 0) { free(buf); return NULL; }
     plist_t pl = NULL;
-    plist_from_memory((const char *)buf, (uint32_t)n, &pl, NULL);
+    rp_plist_from_memory(buf, n, &pl);
     free(buf);
     if (pl && plist_get_node_type(pl) != PLIST_DICT) { plist_free(pl); return NULL; }
     return pl;
@@ -102,7 +117,7 @@ static plist_t recv_plist(int fd)
 static int rsd_checkin(int fd)
 {
     plist_t req = plist_new_dict();
-    dset_str(req, "Label", "rplay-hub");
+    dset_str(req, "Label", "cesium-core");
     dset_str(req, "ProtocolVersion", "2");
     dset_str(req, "Request", "RSDCheckin");
     int ok = send_plist(fd, req) == 0;
@@ -183,12 +198,12 @@ static int read_file(const char *path, uint8_t **out, size_t *n)
 
 static plist_t load_manifest(const char *ddi_dir)
 {
-    char path[1200];
+    char path[4096];
     snprintf(path, sizeof path, "%s/Restore/BuildManifest.plist", ddi_dir);
     uint8_t *b; size_t n;
     if (read_file(path, &b, &n) != 0) return NULL;
     plist_t pl = NULL;
-    plist_from_memory((const char *)b, (uint32_t)n, &pl, NULL);
+    rp_plist_from_memory(b, n, &pl);
     free(b);
     if (pl && plist_get_node_type(pl) != PLIST_DICT) { plist_free(pl); return NULL; }
     return pl;
@@ -360,6 +375,7 @@ static char *tss_post(const uint8_t *body, size_t blen, size_t *rlen)
     if (fd < 0) return NULL;
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx) SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     SSL *ssl = ctx ? SSL_new(ctx) : NULL;
     if (!ssl) { if (ctx) SSL_CTX_free(ctx); close(fd); return NULL; }
     SSL_set_tlsext_host_name(ssl, "gs.apple.com");
@@ -396,7 +412,7 @@ static uint8_t *tss_extract_ticket(const char *resp, size_t rlen, size_t *tlen)
     if (!rs) return NULL;
     rs += strlen("REQUEST_STRING=");
     plist_t pl = NULL;
-    plist_from_memory(rs, (uint32_t)strlen(rs), &pl, NULL);
+    rp_plist_from_memory(rs, strlen(rs), &pl);
     if (!pl || plist_get_node_type(pl) != PLIST_DICT) { if (pl) plist_free(pl); return NULL; }
     plist_t ticket = dget(pl, "ApImg4Ticket");
     uint8_t *out = NULL;
@@ -413,15 +429,21 @@ static uint8_t *tss_extract_ticket(const char *resp, size_t rlen, size_t *tlen)
 
 static const char *find_ddi_dir(const char *given, char *buf, size_t cap)
 {
-    const char *candidates[4]; int n = 0;
+    const char *candidates[16]; int n = 0;
     if (given && *given) candidates[n++] = given;
+    const char *cenv = getenv("CESIUM_DDI"); if (cenv && *cenv) candidates[n++] = cenv;
     const char *env = getenv("RPLAY_DDI"); if (env && *env) candidates[n++] = env;
-    /* Where scripts/fetch-ddi.sh puts it -- the way to get one without Xcode, e.g. on Linux. */
     char fetched[1024] = "";
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-    if (xdg && *xdg) snprintf(fetched, sizeof fetched, "%s/rplayhub/iOS_DDI", xdg);
-    else if (home && *home) snprintf(fetched, sizeof fetched, "%s/.local/share/rplayhub/iOS_DDI", home);
+    if (xdg && *xdg) snprintf(fetched, sizeof fetched, "%s/cesium/iOS_DDI", xdg);
+    else if (home && *home) snprintf(fetched, sizeof fetched, "%s/.local/share/cesium/iOS_DDI", home);
     if (fetched[0]) candidates[n++] = fetched;
+    candidates[n++] = "./iOS_DDI";
+    candidates[n++] = "../iOS_DDI";
+    candidates[n++] = "/opt/cesium/iOS_DDI";
+    candidates[n++] = "/usr/local/share/cesium/iOS_DDI";
+    candidates[n++] = "/var/lib/cesium/iOS_DDI";
+    candidates[n++] = "/home/lanforge/.local/share/rplayhub/iOS_DDI";
     candidates[n++] = "/Library/Developer/DeveloperDiskImages/iOS_DDI";
     for (int i = 0; i < n; i++) {
         char p[1200]; snprintf(p, sizeof p, "%s/Restore/BuildManifest.plist", candidates[i]);

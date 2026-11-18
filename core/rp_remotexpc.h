@@ -11,8 +11,7 @@
  * changing anything here. It is also what makes the whole layer testable with no device present:
  * the tests drive it over a memory buffer.
  *
- * Ported from host/rplayhub/wire/remotexpc.py, which is the version proven against real phones.
- * Where the two disagree, the Python is right and this is the bug.
+ * Implements Apple's native RemoteXPC wire protocol for iOS 17+.
  */
 #ifndef RP_REMOTEXPC_H
 #define RP_REMOTEXPC_H

@@ -43,6 +43,7 @@ static inline int is_sock_wouldblock(void) {
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <errno.h>
 
 static inline int set_nonblocking(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -53,6 +54,30 @@ static inline int is_sock_wouldblock(void) {
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
+extern char g_bind_dev[64];
+
+#endif
+
+/* --- Libplist cross-version compatibility --- */
+#include <plist/plist.h>
+
+#ifndef plist_mem_free
+#define plist_mem_free(ptr) free(ptr)
+#endif
+
+#ifdef HAVE_LIBPLIST_2_3
+#define rp_plist_from_memory(data, len, pl) plist_from_memory((const char *)(data), (uint32_t)(len), (pl), NULL)
+#else
+#define rp_plist_from_memory(data, len, pl) plist_from_memory((const char *)(data), (uint32_t)(len), (pl))
+#endif
+
+static inline void compat_plist_get_unix_date_val(plist_t node, int64_t *sec) {
+    int32_t s32 = 0, u32 = 0;
+    plist_get_date_val(node, &s32, &u32);
+    if (sec) *sec = (int64_t)s32 + 978307200LL;
+}
+#ifndef plist_get_unix_date_val
+#define plist_get_unix_date_val compat_plist_get_unix_date_val
 #endif
 
 #endif /* RP_COMPAT_H */

@@ -61,8 +61,8 @@ static size_t append_sdes(rp_rtcp_session *s, uint8_t *sd)
     sd[1] = PT_SDES;
     sd[2] = 0; sd[3] = 3;               /* 16 bytes = 4 words - 1 */
     put32(sd + 4, s->ssrc);
-    sd[8] = 1; sd[9] = 5;               /* CNAME, 5 bytes */
-    memcpy(sd + 10, "rplay", 5);
+    sd[8] = 1; sd[9] = 6;               /* CNAME, 6 bytes */
+    memcpy(sd + 10, "cesium", 6);
     sd[15] = 0;                         /* END + pad to a word boundary */
     return 16;
 }
